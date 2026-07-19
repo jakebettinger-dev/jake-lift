@@ -119,6 +119,13 @@ function App() {
     const [customName, setCustomName] = useState("");
     const [bwInput, setBwInput] = useState("");
     const fileRef = useRef(null);
+    const [sync, setSync] = useState(() => store.get("gymtracker:sync", { owner: "", repo: "", token: "", path: "data.json", auto: false }));
+    const [syncStatus, setSyncStatus] = useState("");
+    const syncMeta = useRef(store.get("gymtracker:sync-meta", { savedAt: 0, sha: null }));
+    const applyingRemote = useRef(false);
+    const syncReady = useRef(false);
+    const pushTimer = useRef(null);
+    const saveSync = (patch) => { const merged = { ...sync, ...patch }; setSync(merged); store.set("gymtracker:sync", merged); };
     useEffect(() => { if (!draft)
         initDay(1); }, []);
     const toastMsg = (m) => { setToast(m); setTimeout(() => setToast(""), 1900); };
@@ -255,6 +262,135 @@ function App() {
         };
         reader.readAsText(file);
     }
+    /* ---- GitHub sync ---- */
+    function collectData() { return { app: "jake-lift", version: 2, savedAt: Date.now(), workouts, habits, bodyweight: bw, notes, water, shopping, reminders, settings: { extraDays, waterGoal } }; }
+    function applyData(d) {
+        var _a;
+        if (Array.isArray(d.workouts)) {
+            setWorkouts(d.workouts);
+            store.set("gymtracker:workouts", d.workouts);
+        }
+        if ((_a = d.habits) === null || _a === void 0 ? void 0 : _a.list) {
+            setHabits(d.habits);
+            store.set("gymtracker:habits", d.habits);
+        }
+        if (Array.isArray(d.bodyweight)) {
+            setBw(d.bodyweight);
+            store.set("gymtracker:bodyweight", d.bodyweight);
+        }
+        if (Array.isArray(d.notes)) {
+            setNotes(d.notes);
+            store.set("gymtracker:notes", d.notes);
+        }
+        if (d.water && typeof d.water === "object") {
+            setWater(d.water);
+            store.set("gymtracker:water", d.water);
+        }
+        if (Array.isArray(d.shopping)) {
+            setShopping(d.shopping);
+            store.set("gymtracker:shopping", d.shopping);
+        }
+        if (Array.isArray(d.reminders)) {
+            setReminders(d.reminders);
+            store.set("gymtracker:reminders", d.reminders);
+        }
+        if (d.settings) {
+            setExtraDays(!!d.settings.extraDays);
+            setWaterGoal(d.settings.waterGoal || 2500);
+            store.set("gymtracker:settings", d.settings);
+        }
+    }
+    const b64encode = (s) => btoa(unescape(encodeURIComponent(s)));
+    const b64decode = (b) => decodeURIComponent(escape(atob(b.replace(/\s/g, ""))));
+    const ghHeaders = () => ({ Authorization: "Bearer " + sync.token, Accept: "application/vnd.github+json" });
+    const ghUrl = () => `https://api.github.com/repos/${sync.owner}/${sync.repo}/contents/${sync.path || "data.json"}`;
+    async function ghGet() {
+        const res = await fetch(ghUrl(), { headers: ghHeaders() });
+        if (res.status === 404)
+            return { sha: null, data: null };
+        if (!res.ok)
+            throw new Error(res.status === 401 ? "token ongeldig" : ("GitHub " + res.status));
+        const j = await res.json();
+        return { sha: j.sha, data: JSON.parse(b64decode(j.content)) };
+    }
+    const configured = () => sync.owner && sync.repo && sync.token;
+    async function pushToGitHub(silent) {
+        var _a;
+        if (!configured()) {
+            if (!silent)
+                setSyncStatus("Vul eerst gebruikersnaam, repo en token in.");
+            return;
+        }
+        try {
+            if (!silent)
+                setSyncStatus("Bezig met opslaan…");
+            let sha = null;
+            try {
+                sha = (await ghGet()).sha;
+            }
+            catch (_) { }
+            const payload = collectData();
+            const str = JSON.stringify(payload, null, 2);
+            const body = { message: "Jake.Lift " + new Date().toISOString(), content: b64encode(str) };
+            if (sha)
+                body.sha = sha;
+            const res = await fetch(ghUrl(), { method: "PUT", headers: ghHeaders(), body: JSON.stringify(body) });
+            if (!res.ok) {
+                const t = await res.text();
+                throw new Error(res.status + " " + t.slice(0, 90));
+            }
+            const j = await res.json();
+            syncMeta.current = { savedAt: payload.savedAt, sha: ((_a = j.content) === null || _a === void 0 ? void 0 : _a.sha) || null };
+            store.set("gymtracker:sync-meta", syncMeta.current);
+            setSyncStatus("Opgeslagen op GitHub · " + new Date().toLocaleTimeString("nl-NL"));
+        }
+        catch (e) {
+            setSyncStatus("Fout bij opslaan: " + e.message);
+        }
+    }
+    async function pullFromGitHub(silent) {
+        if (!configured()) {
+            if (!silent)
+                setSyncStatus("Vul eerst gebruikersnaam, repo en token in.");
+            return;
+        }
+        try {
+            if (!silent)
+                setSyncStatus("Bezig met ophalen…");
+            const { sha, data } = await ghGet();
+            if (!data) {
+                if (!silent)
+                    setSyncStatus("Nog geen data op GitHub — sla eerst een keer op.");
+                return;
+            }
+            if (silent && data.savedAt && data.savedAt <= (syncMeta.current.savedAt || 0))
+                return;
+            applyingRemote.current = true;
+            applyData(data);
+            syncMeta.current = { savedAt: data.savedAt || Date.now(), sha };
+            store.set("gymtracker:sync-meta", syncMeta.current);
+            setTimeout(() => { applyingRemote.current = false; }, 700);
+            if (!silent)
+                setSyncStatus("Opgehaald van GitHub · " + new Date().toLocaleTimeString("nl-NL"));
+        }
+        catch (e) {
+            setSyncStatus("Fout bij ophalen: " + e.message);
+        }
+    }
+    useEffect(() => { (async () => { if (sync.auto && configured()) {
+        await pullFromGitHub(true);
+    } syncReady.current = true; })(); }, []);
+    useEffect(() => {
+        if (!syncReady.current || applyingRemote.current)
+            return;
+        if (!sync.auto || !configured())
+            return;
+        if (pushTimer.current)
+            clearTimeout(pushTimer.current);
+        pushTimer.current = setTimeout(() => { pushToGitHub(true); }, 2500);
+        return () => { if (pushTimer.current)
+            clearTimeout(pushTimer.current); };
+    }, [workouts, habits, bw, notes, water, shopping, reminders, extraDays, waterGoal, sync.auto]);
     const lastSessionTop = useCallback((ex) => { for (let i = workouts.length - 1; i >= 0; i--) {
         const f = workouts[i].exercises.find(e => e.name === ex);
         if (f)
@@ -310,7 +446,7 @@ function App() {
             tab === "lists" && React.createElement(ListsTab, { notes: notes, addNote: addNote, updateNote: updateNote, deleteNote: deleteNote, shopping: shopping, addShop: addShop, toggleShop: toggleShop, deleteShop: deleteShop, clearChecked: clearChecked, reminders: reminders, addReminder: addReminder, toggleReminder: toggleReminder, deleteReminder: deleteReminder }),
             tab === "habits" && React.createElement(HabitsTab, { habits: habits, last7: last7, toggleHabit: toggleHabit, addHabit: addHabit, removeHabit: removeHabit, streakOf: streakOf })),
         showSettings && (React.createElement("div", { onClick: () => setShowSettings(false), style: { position: "fixed", inset: 0, background: "rgba(8,10,14,.72)", display: "flex", alignItems: "flex-end", zIndex: 20 } },
-            React.createElement("div", { onClick: (e) => e.stopPropagation(), style: { width: "100%", maxWidth: 480, margin: "0 auto", background: c.surface, borderTop: `1px solid ${c.line}`, borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: `18px 18px calc(24px + env(safe-area-inset-bottom))` } },
+            React.createElement("div", { onClick: (e) => e.stopPropagation(), style: { width: "100%", maxWidth: 480, margin: "0 auto", maxHeight: "88vh", overflowY: "auto", background: c.surface, borderTop: `1px solid ${c.line}`, borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: `18px 18px calc(24px + env(safe-area-inset-bottom))` } },
                 React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 } },
                     React.createElement("div", { style: { fontFamily: fDisp, fontSize: 21, fontWeight: 600 } }, "Instellingen"),
                     React.createElement("button", { onClick: () => setShowSettings(false), style: { background: "none", border: "none", color: c.dim, cursor: "pointer", fontSize: 18 } }, "\u2715")),
@@ -324,6 +460,21 @@ function App() {
                         React.createElement("div", { style: { fontWeight: 600, fontSize: 14 } }, "Water-doel per dag"),
                         React.createElement("div", { style: { color: c.faint, fontSize: 11.5, marginTop: 2 } }, "In milliliter")),
                     React.createElement("input", { value: waterGoal, onChange: (e) => changeGoal(parseInt(e.target.value.replace(/\D/g, "")) || 0), inputMode: "numeric", style: { width: 90, textAlign: "center", background: c.surfaceHi, color: c.text, border: `1px solid ${c.line}`, borderRadius: 10, height: 38, fontFamily: fDisp, fontSize: 17, fontWeight: 600, outline: "none" } })),
+                React.createElement("div", { style: { background: c.bg, border: `1px solid ${c.line}`, borderRadius: 12, padding: 14, marginBottom: 12 } },
+                    React.createElement("div", { style: { fontWeight: 600, fontSize: 14, marginBottom: 3 } }, "Synchroniseren via GitHub"),
+                    React.createElement("div", { style: { color: c.faint, fontSize: 11.5, marginBottom: 10, lineHeight: 1.5 } }, "Sla je data op in een priv\u00E9 GitHub-repo om hem op meerdere apparaten te gebruiken. Je token blijft alleen op dit apparaat."),
+                    React.createElement("input", { value: sync.owner, onChange: (e) => saveSync({ owner: e.target.value.trim() }), placeholder: "GitHub-gebruikersnaam", autoCapitalize: "none", autoCorrect: "off", style: { ...inputStyle(1), width: "100%", marginBottom: 8 } }),
+                    React.createElement("input", { value: sync.repo, onChange: (e) => saveSync({ repo: e.target.value.trim() }), placeholder: "Data-repo (bijv. jake-lift-data)", autoCapitalize: "none", autoCorrect: "off", style: { ...inputStyle(1), width: "100%", marginBottom: 8 } }),
+                    React.createElement("input", { type: "password", value: sync.token, onChange: (e) => saveSync({ token: e.target.value.trim() }), placeholder: "Token (github_pat_\u2026)", autoCapitalize: "none", autoCorrect: "off", style: { ...inputStyle(1), width: "100%", marginBottom: 10 } }),
+                    React.createElement("div", { style: { display: "flex", gap: 9, marginBottom: 11 } },
+                        React.createElement("button", { onClick: () => pushToGitHub(false), style: { flex: 1, background: c.accent, color: "#1a1500", border: "none", borderRadius: 10, padding: 11, cursor: "pointer", fontWeight: 700, fontSize: 13 } }, "\u2191 Opslaan"),
+                        React.createElement("button", { onClick: () => pullFromGitHub(false), style: { flex: 1, background: c.surfaceHi, color: c.text, border: `1px solid ${c.line}`, borderRadius: 10, padding: 11, cursor: "pointer", fontWeight: 600, fontSize: 13 } }, "\u2193 Ophalen")),
+                    React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between" } },
+                        React.createElement("div", null,
+                            React.createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, "Automatisch synchroniseren"),
+                            React.createElement("div", { style: { color: c.faint, fontSize: 11 } }, "Opslaan bij wijziging, ophalen bij opstarten")),
+                        React.createElement(Toggle, { on: sync.auto, onClick: () => saveSync({ auto: !sync.auto }) })),
+                    syncStatus && React.createElement("div", { style: { color: c.dim, fontSize: 11.5, marginTop: 10 } }, syncStatus)),
                 React.createElement("div", { style: { background: c.bg, border: `1px solid ${c.line}`, borderRadius: 12, padding: 14 } },
                     React.createElement("div", { style: { fontWeight: 600, fontSize: 14, marginBottom: 3 } }, "Back-up van je data"),
                     React.createElement("div", { style: { color: c.faint, fontSize: 11.5, marginBottom: 12, lineHeight: 1.5 } }, "Verhuis je data van/naar de Claude-versie via dit bestand. Maak regelmatig een back-up \u2014 bij het wissen van Safari-data raak je hem anders kwijt."),

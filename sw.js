@@ -1,7 +1,7 @@
 /* Jake.Lift service worker.
    Network-first so updates always show when online; falls back to cache offline.
    Bump CACHE (v2 -> v3 ...) whenever you upload a new app.js or index.html. */
-const CACHE = "jakelift-v2";
+const CACHE = "jakelift-v3";
 
 const SHELL = [
   "./", "./index.html", "./app.js", "./manifest.webmanifest",
