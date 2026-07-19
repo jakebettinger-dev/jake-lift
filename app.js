@@ -121,6 +121,9 @@ function App() {
     const fileRef = useRef(null);
     const [sync, setSync] = useState(() => store.get("gymtracker:sync", { owner: "", repo: "", token: "", path: "data.json", auto: false }));
     const [syncStatus, setSyncStatus] = useState("");
+    const [showLog, setShowLog] = useState(false);
+    const [logItems, setLogItems] = useState(null);
+    const [logErr, setLogErr] = useState("");
     const syncMeta = useRef(store.get("gymtracker:sync-meta", { savedAt: 0, sha: null }));
     const applyingRemote = useRef(false);
     const syncReady = useRef(false);
@@ -132,9 +135,26 @@ function App() {
         initDay(1); }, []);
     const toastMsg = (m) => { setToast(m); setTimeout(() => setToast(""), 1900); };
     const saveSettings = (patch) => store.set("gymtracker:settings", { extraDays, waterGoal, ...patch });
-    function initDay(dn) {
+    function lastSessionSets(ex, src) {
+        const list = src || workouts;
+        for (let i = list.length - 1; i >= 0; i--) {
+            const f = list[i].exercises.find(e => e.name === ex);
+            if (f && f.sets && f.sets.length)
+                return f.sets;
+        }
+        return null;
+    }
+    function initDay(dn, src) {
+        const list = src || workouts;
         const dr = {}, ord = [];
-        PROGRAM[dn].ex.forEach(([name, sets]) => { dr[name] = Array.from({ length: sets }, () => ({ w: "", r: "" })); ord.push(name); });
+        PROGRAM[dn].ex.forEach(([name, sets]) => {
+            const prev = lastSessionSets(name, list);
+            dr[name] = Array.from({ length: sets }, (_, i) => {
+                const p = prev ? (prev[i] || prev[prev.length - 1]) : null; // start from last time's weight/reps
+                return p ? { w: String(p.w), r: String(p.r) } : { w: "", r: "" };
+            });
+            ord.push(name);
+        });
         setDraft(dr);
         setOrder(ord);
         store.set("gymtracker:draft", { day: dn, draft: dr, order: ord });
@@ -165,7 +185,7 @@ function App() {
         const next = [...workouts, session];
         setWorkouts(next);
         store.set("gymtracker:workouts", next);
-        initDay(day);
+        initDay(day, next);
         toastMsg("Training opgeslagen 💪");
     }
     function addWater(ml) { const t = today(); const val = Math.max(0, (water[t] || 0) + ml); const n = { ...water, [t]: val }; setWater(n); store.set("gymtracker:water", n); }
@@ -266,6 +286,66 @@ function App() {
     }
     /* ---- GitHub sync ---- */
     function collectData() { return { app: "jake-lift", version: 2, savedAt: Date.now(), workouts, habits, bodyweight: bw, notes, water, shopping, reminders, settings: { extraDays, waterGoal } }; }
+    // Merge local + remote so nothing added on any device is lost. Union by id/date;
+    // on a real conflict the newer save (higher savedAt) wins.
+    function mergeData(local, remote) {
+        if (!remote)
+            return local;
+        const rNew = (remote.savedAt || 0) >= (local.savedAt || 0);
+        const byId = (a, b) => { const m = new Map(); const [o, n] = rNew ? [a || [], b || []] : [b || [], a || []]; [...o, ...n].forEach(it => { if (it && it.id != null)
+            m.set(it.id, it); }); return [...m.values()]; };
+        const byDate = (a, b) => { const m = new Map(); const [o, n] = rNew ? [a || [], b || []] : [b || [], a || []]; [...o, ...n].forEach(it => { if (it && it.date != null)
+            m.set(it.date, it); }); return [...m.values()].sort((x, y) => String(x.date).localeCompare(String(y.date))); };
+        const objMerge = (a, b) => { const [o, n] = rNew ? [a || {}, b || {}] : [b || {}, a || {}]; return { ...o, ...n }; };
+        const lh = local.habits || { list: [], log: {} }, rh = remote.habits || { list: [], log: {} };
+        return {
+            app: "jake-lift", version: 2, savedAt: Math.max(local.savedAt || 0, remote.savedAt || 0),
+            workouts: byId(local.workouts, remote.workouts),
+            habits: { list: byId(lh.list, rh.list), log: objMerge(lh.log, rh.log) },
+            bodyweight: byDate(local.bodyweight, remote.bodyweight),
+            notes: byId(local.notes, remote.notes),
+            water: objMerge(local.water, remote.water),
+            shopping: byId(local.shopping, remote.shopping),
+            reminders: byId(local.reminders, remote.reminders),
+            settings: rNew ? (remote.settings || local.settings) : (local.settings || remote.settings),
+        };
+    }
+    const noTs = (o) => { if (!o)
+        return ""; const { savedAt, ...rest } = o; return JSON.stringify(rest); };
+    // Human-readable summary of what changed (old = what was on GitHub, neu = what we're writing).
+    function describeChange(oldD, neu) {
+        oldD = oldD || {};
+        const parts = [];
+        const ow = oldD.workouts || [], nw = neu.workouts || [];
+        if (nw.length > ow.length) {
+            const w = nw[nw.length - 1];
+            const ex = (w.exercises || []).map(e => { const t = topSet(e.sets); return t ? `${e.name} ${t.w}kg×${t.r}` : e.name; });
+            parts.push(`Training ${w.dayName || ""}: ` + ex.slice(0, 4).join(", ") + (ex.length > 4 ? "…" : ""));
+        }
+        if (JSON.stringify(oldD.bodyweight || []) !== JSON.stringify(neu.bodyweight || [])) {
+            const last = (neu.bodyweight || [])[(neu.bodyweight || []).length - 1];
+            if (last)
+                parts.push(`Gewicht ${last.kg}kg`);
+        }
+        if (JSON.stringify(oldD.water || {}) !== JSON.stringify(neu.water || {})) {
+            const t = today();
+            parts.push(neu.water && neu.water[t] != null ? `Water ${neu.water[t]}ml` : "Water bijgewerkt");
+        }
+        const non = (oldD.notes || []).length, nnn = (neu.notes || []).length;
+        if (nnn > non)
+            parts.push("Notitie toegevoegd");
+        else if (JSON.stringify(oldD.notes || []) !== JSON.stringify(neu.notes || []))
+            parts.push("Notitie bewerkt");
+        if (JSON.stringify(oldD.shopping || []) !== JSON.stringify(neu.shopping || []))
+            parts.push("Boodschappen bijgewerkt");
+        if (JSON.stringify(oldD.reminders || []) !== JSON.stringify(neu.reminders || []))
+            parts.push("Herinneringen bijgewerkt");
+        if (JSON.stringify(oldD.habits || {}) !== JSON.stringify(neu.habits || {}))
+            parts.push("Gewoontes bijgewerkt");
+        if (JSON.stringify(oldD.settings || {}) !== JSON.stringify(neu.settings || {}))
+            parts.push("Instellingen bijgewerkt");
+        return parts.length ? parts.join(" · ") : "Data bijgewerkt";
+    }
     function applyData(d) {
         var _a;
         if (Array.isArray(d.workouts)) {
@@ -334,24 +414,31 @@ function App() {
         try {
             if (!silent)
                 setSyncStatus("Bezig met opslaan…");
-            const payload = collectData();
-            const str = JSON.stringify(payload, null, 2);
             let lastErr = "onbekende fout";
-            // Retry on sha-conflict (409/422): re-fetch the current sha and try again.
+            // Retry on sha-conflict (409/422): re-fetch the current sha + data and merge again.
             for (let attempt = 0; attempt < 3; attempt++) {
-                let sha = null;
+                let sha = null, remote = null;
                 try {
-                    sha = (await ghGet()).sha;
+                    const g = await ghGet();
+                    sha = g.sha;
+                    remote = g.data;
                 }
                 catch (_) { }
-                const body = { message: "Jake.Lift " + new Date().toISOString(), content: b64encode(str) };
+                const local = collectData();
+                const merged = { ...mergeData(local, remote), savedAt: Date.now() }; // union: never lose another device's data
+                const body = { message: describeChange(remote, merged), content: b64encode(JSON.stringify(merged, null, 2)) };
                 if (sha)
                     body.sha = sha;
                 const res = await fetch(ghUrl(), { method: "PUT", headers: ghHeaders(), body: JSON.stringify(body) });
                 if (res.ok) {
                     const j = await res.json();
-                    syncMeta.current = { savedAt: payload.savedAt, sha: ((_a = j.content) === null || _a === void 0 ? void 0 : _a.sha) || null };
+                    syncMeta.current = { savedAt: merged.savedAt, sha: ((_a = j.content) === null || _a === void 0 ? void 0 : _a.sha) || null };
                     store.set("gymtracker:sync-meta", syncMeta.current);
+                    if (noTs(merged) !== noTs(local)) {
+                        applyingRemote.current = true;
+                        applyData(merged);
+                        setTimeout(() => { applyingRemote.current = false; }, 700);
+                    } // reflect other devices' items locally
                     setSyncStatus("Opgeslagen op GitHub · " + new Date().toLocaleTimeString("nl-NL"));
                     return;
                 }
@@ -388,15 +475,18 @@ function App() {
                     setSyncStatus("Nog geen data op GitHub — sla eerst een keer op.");
                 return;
             }
-            if (silent && data.savedAt && data.savedAt <= (syncMeta.current.savedAt || 0))
-                return;
+            const local = collectData();
+            const merged = mergeData(local, data); // merge instead of overwrite: keep this device's data too
             applyingRemote.current = true;
-            applyData(data);
-            syncMeta.current = { savedAt: data.savedAt || Date.now(), sha };
+            applyData(merged);
+            syncMeta.current = { savedAt: merged.savedAt || Date.now(), sha };
             store.set("gymtracker:sync-meta", syncMeta.current);
             setTimeout(() => { applyingRemote.current = false; }, 700);
             if (!silent)
                 setSyncStatus("Opgehaald van GitHub · " + new Date().toLocaleTimeString("nl-NL"));
+            // If this device had items the remote didn't, push the union back so all devices converge.
+            if (noTs(merged) !== noTs(data))
+                setTimeout(() => pushToGitHub(true), 900);
         }
         catch (e) {
             setSyncStatus("Fout bij ophalen: " + e.message);
@@ -415,6 +505,26 @@ function App() {
         }
         catch (_) { }
         location.replace(location.pathname.replace(/[?#].*$/, "") + "?r=" + Date.now());
+    }
+    async function openLog() {
+        setShowLog(true);
+        setLogItems(null);
+        setLogErr("");
+        if (!configured()) {
+            setLogErr("Configureer eerst GitHub-sync hierboven.");
+            return;
+        }
+        try {
+            const url = `https://api.github.com/repos/${sync.owner}/${sync.repo}/commits?path=${sync.path || "data.json"}&per_page=40&nc=` + Date.now();
+            const res = await fetch(url, { headers: ghHeaders(), cache: "no-store" });
+            if (!res.ok)
+                throw new Error(res.status === 401 ? "token ongeldig" : ("GitHub " + res.status));
+            const j = await res.json();
+            setLogItems(j.map(c => { var _a, _b, _c, _d, _e; return ({ sha: (c.sha || "").slice(0, 7), msg: ((_a = c.commit) === null || _a === void 0 ? void 0 : _a.message) || "(geen bericht)", date: ((_c = (_b = c.commit) === null || _b === void 0 ? void 0 : _b.author) === null || _c === void 0 ? void 0 : _c.date) || ((_e = (_d = c.commit) === null || _d === void 0 ? void 0 : _d.committer) === null || _e === void 0 ? void 0 : _e.date) || null }); }));
+        }
+        catch (e) {
+            setLogErr(e.message);
+        }
     }
     useEffect(() => { (async () => { if (sync.auto && configured()) {
         await pullFromGitHub(true);
@@ -513,7 +623,8 @@ function App() {
                             React.createElement("div", { style: { fontSize: 13, fontWeight: 600 } }, "Automatisch synchroniseren"),
                             React.createElement("div", { style: { color: c.faint, fontSize: 11 } }, "Opslaan bij wijziging, ophalen bij opstarten")),
                         React.createElement(Toggle, { on: sync.auto, onClick: () => saveSync({ auto: !sync.auto }) })),
-                    syncStatus && React.createElement("div", { style: { color: c.dim, fontSize: 11.5, marginTop: 10 } }, syncStatus)),
+                    syncStatus && React.createElement("div", { style: { color: c.dim, fontSize: 11.5, marginTop: 10 } }, syncStatus),
+                    React.createElement("button", { onClick: openLog, style: { width: "100%", marginTop: 10, background: c.surfaceHi, color: c.text, border: `1px solid ${c.line}`, borderRadius: 10, padding: 11, cursor: "pointer", fontWeight: 600, fontSize: 13 } }, "\uD83D\uDCDC Wijzigingslog bekijken")),
                 React.createElement("div", { style: { background: c.bg, border: `1px solid ${c.line}`, borderRadius: 12, padding: 14 } },
                     React.createElement("div", { style: { fontWeight: 600, fontSize: 14, marginBottom: 3 } }, "Back-up van je data"),
                     React.createElement("div", { style: { color: c.faint, fontSize: 11.5, marginBottom: 12, lineHeight: 1.5 } }, "Verhuis je data van/naar de Claude-versie via dit bestand. Maak regelmatig een back-up \u2014 bij het wissen van Safari-data raak je hem anders kwijt."),
@@ -525,6 +636,20 @@ function App() {
                     React.createElement("div", { style: { fontWeight: 600, fontSize: 14, marginBottom: 3 } }, "App vernieuwen"),
                     React.createElement("div", { style: { color: c.faint, fontSize: 11.5, marginBottom: 12, lineHeight: 1.5 } }, "Wist de cache en herlaadt de nieuwste versie. Handig als de app na een update oud gedrag of een foutmelding blijft tonen. Je data blijft behouden."),
                     React.createElement("button", { onClick: forceRefresh, style: { width: "100%", background: c.surfaceHi, color: c.text, border: `1px solid ${c.line}`, borderRadius: 10, padding: 11, cursor: "pointer", fontWeight: 600, fontSize: 13 } }, "\u21BB Cache wissen en herladen"))))),
+        showLog && (React.createElement("div", { onClick: () => setShowLog(false), style: { position: "fixed", inset: 0, background: "rgba(8,10,14,.72)", display: "flex", alignItems: "flex-end", zIndex: 25 } },
+            React.createElement("div", { onClick: (e) => e.stopPropagation(), style: { width: "100%", maxWidth: 480, margin: "0 auto", maxHeight: "88vh", overflowY: "auto", background: c.surface, borderTop: `1px solid ${c.line}`, borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: `18px 18px calc(24px + env(safe-area-inset-bottom))` } },
+                React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 } },
+                    React.createElement("div", { style: { fontFamily: fDisp, fontSize: 21, fontWeight: 600 } }, "Wijzigingslog"),
+                    React.createElement("button", { onClick: () => setShowLog(false), style: { background: "none", border: "none", color: c.dim, cursor: "pointer", fontSize: 18 } }, "\u2715")),
+                React.createElement("div", { style: { color: c.faint, fontSize: 11.5, marginBottom: 14, lineHeight: 1.5 } }, "De laatste wijzigingen die naar GitHub zijn opgeslagen."),
+                logErr && React.createElement("div", { style: { color: "#f87171", fontSize: 12.5, marginBottom: 10, lineHeight: 1.5 } }, logErr),
+                !logItems && !logErr && React.createElement("div", { style: { color: c.dim, fontSize: 13 } }, "Laden\u2026"),
+                logItems && logItems.length === 0 && React.createElement("div", { style: { color: c.faint, fontSize: 13 } }, "Nog geen wijzigingen gevonden."),
+                logItems && logItems.map((it, idx) => (React.createElement("div", { key: it.sha + idx, style: { background: c.bg, border: `1px solid ${c.line}`, borderRadius: 12, padding: "11px 13px", marginBottom: 8 } },
+                    React.createElement("div", { style: { fontSize: 13, fontWeight: 600, color: c.text, lineHeight: 1.4 } }, it.msg),
+                    React.createElement("div", { style: { color: c.faint, fontSize: 11, marginTop: 4 } },
+                        it.date ? new Date(it.date).toLocaleString("nl-NL", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "",
+                        it.sha ? " · " + it.sha : ""))))))),
         toast && (React.createElement("div", { style: { position: "fixed", bottom: "calc(90px + env(safe-area-inset-bottom))", left: 0, right: 0, display: "flex", justifyContent: "center", pointerEvents: "none", zIndex: 30 } },
             React.createElement("div", { style: { background: c.accent, color: "#1a1500", fontWeight: 600, fontSize: 13, padding: "9px 16px", borderRadius: 999, boxShadow: "0 8px 24px rgba(0,0,0,.4)" } }, toast))),
         React.createElement("div", { style: { position: "fixed", bottom: 0, left: 0, right: 0, background: c.surface, borderTop: `1px solid ${c.line}`, display: "flex", padding: `8px 4px ${navPadBottom}`, zIndex: 10 } },
