@@ -125,6 +125,8 @@ function App() {
     const applyingRemote = useRef(false);
     const syncReady = useRef(false);
     const pushTimer = useRef(null);
+    const pushing = useRef(false);
+    const pushPending = useRef(false);
     const saveSync = (patch) => { const merged = { ...sync, ...patch }; setSync(merged); store.set("gymtracker:sync", merged); };
     useEffect(() => { if (!draft)
         initDay(1); }, []);
@@ -321,31 +323,52 @@ function App() {
                 setSyncStatus("Vul eerst gebruikersnaam, repo en token in.");
             return;
         }
+        // Serialize pushes: if one is already running, mark that another is needed and bail.
+        if (pushing.current) {
+            pushPending.current = true;
+            return;
+        }
+        pushing.current = true;
         try {
             if (!silent)
                 setSyncStatus("Bezig met opslaan…");
-            let sha = null;
-            try {
-                sha = (await ghGet()).sha;
-            }
-            catch (_) { }
             const payload = collectData();
             const str = JSON.stringify(payload, null, 2);
-            const body = { message: "Jake.Lift " + new Date().toISOString(), content: b64encode(str) };
-            if (sha)
-                body.sha = sha;
-            const res = await fetch(ghUrl(), { method: "PUT", headers: ghHeaders(), body: JSON.stringify(body) });
-            if (!res.ok) {
+            let lastErr = "onbekende fout";
+            // Retry on sha-conflict (409/422): re-fetch the current sha and try again.
+            for (let attempt = 0; attempt < 3; attempt++) {
+                let sha = null;
+                try {
+                    sha = (await ghGet()).sha;
+                }
+                catch (_) { }
+                const body = { message: "Jake.Lift " + new Date().toISOString(), content: b64encode(str) };
+                if (sha)
+                    body.sha = sha;
+                const res = await fetch(ghUrl(), { method: "PUT", headers: ghHeaders(), body: JSON.stringify(body) });
+                if (res.ok) {
+                    const j = await res.json();
+                    syncMeta.current = { savedAt: payload.savedAt, sha: ((_a = j.content) === null || _a === void 0 ? void 0 : _a.sha) || null };
+                    store.set("gymtracker:sync-meta", syncMeta.current);
+                    setSyncStatus("Opgeslagen op GitHub · " + new Date().toLocaleTimeString("nl-NL"));
+                    return;
+                }
                 const t = await res.text();
-                throw new Error(res.status + " " + t.slice(0, 90));
+                lastErr = res.status + " " + t.slice(0, 90);
+                if (res.status !== 409 && res.status !== 422)
+                    break; // only conflicts are worth retrying
             }
-            const j = await res.json();
-            syncMeta.current = { savedAt: payload.savedAt, sha: ((_a = j.content) === null || _a === void 0 ? void 0 : _a.sha) || null };
-            store.set("gymtracker:sync-meta", syncMeta.current);
-            setSyncStatus("Opgeslagen op GitHub · " + new Date().toLocaleTimeString("nl-NL"));
+            throw new Error(lastErr);
         }
         catch (e) {
             setSyncStatus("Fout bij opslaan: " + e.message);
+        }
+        finally {
+            pushing.current = false;
+            if (pushPending.current) {
+                pushPending.current = false;
+                pushToGitHub(true);
+            } // flush the queued change with fresh data
         }
     }
     async function pullFromGitHub(silent) {
