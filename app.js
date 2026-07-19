@@ -307,7 +307,9 @@ function App() {
     const ghHeaders = () => ({ Authorization: "Bearer " + sync.token, Accept: "application/vnd.github+json" });
     const ghUrl = () => `https://api.github.com/repos/${sync.owner}/${sync.repo}/contents/${sync.path || "data.json"}`;
     async function ghGet() {
-        const res = await fetch(ghUrl(), { headers: ghHeaders() });
+        // Bypass the browser HTTP cache (GitHub sends Cache-Control: private, max-age=60),
+        // otherwise we'd read a stale sha and every PUT would 409. Cache-buster + no-store.
+        const res = await fetch(ghUrl() + "?nc=" + Date.now(), { headers: ghHeaders(), cache: "no-store" });
         if (res.status === 404)
             return { sha: null, data: null };
         if (!res.ok)
