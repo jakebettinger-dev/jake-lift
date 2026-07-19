@@ -400,6 +400,20 @@ function App() {
             setSyncStatus("Fout bij ophalen: " + e.message);
         }
     }
+    async function forceRefresh() {
+        try {
+            if ("serviceWorker" in navigator) {
+                const regs = await navigator.serviceWorker.getRegistrations();
+                await Promise.all(regs.map(r => r.unregister()));
+            }
+            if (window.caches) {
+                const keys = await caches.keys();
+                await Promise.all(keys.map(k => caches.delete(k)));
+            }
+        }
+        catch (_) { }
+        location.replace(location.pathname.replace(/[?#].*$/, "") + "?r=" + Date.now());
+    }
     useEffect(() => { (async () => { if (sync.auto && configured()) {
         await pullFromGitHub(true);
     } syncReady.current = true; })(); }, []);
@@ -504,7 +518,11 @@ function App() {
                     React.createElement("div", { style: { display: "flex", gap: 9 } },
                         React.createElement("button", { onClick: exportData, style: { flex: 1, background: c.accent, color: "#1a1500", border: "none", borderRadius: 10, padding: 11, cursor: "pointer", fontWeight: 700, fontSize: 13 } }, "\u2193 Exporteren"),
                         React.createElement("button", { onClick: () => { var _a; return (_a = fileRef.current) === null || _a === void 0 ? void 0 : _a.click(); }, style: { flex: 1, background: c.surfaceHi, color: c.text, border: `1px solid ${c.line}`, borderRadius: 10, padding: 11, cursor: "pointer", fontWeight: 600, fontSize: 13 } }, "\u2191 Importeren")),
-                    React.createElement("input", { ref: fileRef, type: "file", accept: "application/json,.json", onChange: handleFile, style: { display: "none" } }))))),
+                    React.createElement("input", { ref: fileRef, type: "file", accept: "application/json,.json", onChange: handleFile, style: { display: "none" } })),
+                React.createElement("div", { style: { background: c.bg, border: `1px solid ${c.line}`, borderRadius: 12, padding: 14 } },
+                    React.createElement("div", { style: { fontWeight: 600, fontSize: 14, marginBottom: 3 } }, "App vernieuwen"),
+                    React.createElement("div", { style: { color: c.faint, fontSize: 11.5, marginBottom: 12, lineHeight: 1.5 } }, "Wist de cache en herlaadt de nieuwste versie. Handig als de app na een update oud gedrag of een foutmelding blijft tonen. Je data blijft behouden."),
+                    React.createElement("button", { onClick: forceRefresh, style: { width: "100%", background: c.surfaceHi, color: c.text, border: `1px solid ${c.line}`, borderRadius: 10, padding: 11, cursor: "pointer", fontWeight: 600, fontSize: 13 } }, "\u21BB Cache wissen en herladen"))))),
         toast && (React.createElement("div", { style: { position: "fixed", bottom: "calc(90px + env(safe-area-inset-bottom))", left: 0, right: 0, display: "flex", justifyContent: "center", pointerEvents: "none", zIndex: 30 } },
             React.createElement("div", { style: { background: c.accent, color: "#1a1500", fontWeight: 600, fontSize: 13, padding: "9px 16px", borderRadius: 999, boxShadow: "0 8px 24px rgba(0,0,0,.4)" } }, toast))),
         React.createElement("div", { style: { position: "fixed", bottom: 0, left: 0, right: 0, background: c.surface, borderTop: `1px solid ${c.line}`, display: "flex", padding: `8px 4px ${navPadBottom}`, zIndex: 10 } },
