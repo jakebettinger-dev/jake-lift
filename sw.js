@@ -1,27 +1,21 @@
-/* Jake.Lift service worker — offline app shell.
-   Bump CACHE (v1 -> v2) whenever you upload a new index.html so phones fetch the update. */
-const CACHE = "jakelift-v1";
+/* Jake.Lift service worker.
+   Network-first so updates always show when online; falls back to cache offline.
+   Bump CACHE (v2 -> v3 ...) whenever you upload a new app.js or index.html. */
+const CACHE = "jakelift-v2";
 
 const SHELL = [
-  "./",
-  "./index.html",
-  "./manifest.webmanifest",
-  "./icon-192.png",
-  "./icon-512.png",
-  "./apple-touch-icon.png",
+  "./", "./index.html", "./app.js", "./manifest.webmanifest",
+  "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png",
 ];
-
 const CDN = [
   "https://unpkg.com/react@18/umd/react.production.min.js",
   "https://unpkg.com/react-dom@18/umd/react-dom.production.min.js",
-  "https://unpkg.com/@babel/standalone/babel.min.js",
 ];
 
 self.addEventListener("install", (e) => {
   e.waitUntil((async () => {
     const cache = await caches.open(CACHE);
     await cache.addAll(SHELL).catch(() => {});
-    // Best-effort: cache the CDN libraries so the app also works fully offline.
     await Promise.all(CDN.map(async (u) => {
       try { const r = await fetch(u, { mode: "no-cors" }); await cache.put(u, r); } catch (_) {}
     }));
@@ -33,20 +27,30 @@ self.addEventListener("activate", (e) => {
   e.waitUntil((async () => {
     const keys = await caches.keys();
     await Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k)));
-    self.clients.claim();
+    await self.clients.claim();
   })());
 });
 
 self.addEventListener("fetch", (e) => {
-  if (e.request.method !== "GET") return;
+  const req = e.request;
+  if (req.method !== "GET") return;
+  const sameOrigin = new URL(req.url).origin === self.location.origin;
   e.respondWith((async () => {
-    const cached = await caches.match(e.request);
-    if (cached) return cached;
     try {
-      return await fetch(e.request);
+      const res = await fetch(req);
+      if (sameOrigin && res && res.ok) {
+        const cache = await caches.open(CACHE);
+        cache.put(req, res.clone());
+      }
+      return res;
     } catch (_) {
-      const fallback = await caches.match("./index.html");
-      return fallback || Response.error();
+      const cached = await caches.match(req);
+      if (cached) return cached;
+      if (req.mode === "navigate") {
+        const shell = await caches.match("./index.html");
+        if (shell) return shell;
+      }
+      return Response.error();
     }
   })());
 });
