@@ -3,7 +3,7 @@
    Same-origin requests bypass the HTTP cache ({cache:"reload"}) so a new app.js
    is always picked up when online — this is what makes updates land on iOS PWAs.
    Bump CACHE (v4 -> v5 ...) whenever you upload a new app.js or index.html. */
-const CACHE = "jakelift-v7";
+const CACHE = "jakelift-v8";
 
 const SHELL = [
   "./", "./index.html", "./app.js", "./manifest.webmanifest",

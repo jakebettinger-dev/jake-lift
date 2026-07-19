@@ -124,6 +124,8 @@ function App() {
     const [showLog, setShowLog] = useState(false);
     const [logItems, setLogItems] = useState(null);
     const [logErr, setLogErr] = useState("");
+    const [confirmBox, setConfirmBox] = useState(null);
+    const ask = (msg, onYes, yes) => setConfirmBox({ msg, onYes, yes: yes || "Verwijderen" });
     const syncMeta = useRef(store.get("gymtracker:sync-meta", { savedAt: 0, sha: null }));
     const applyingRemote = useRef(false);
     const syncReady = useRef(false);
@@ -192,23 +194,19 @@ function App() {
     function addShop(text) { const t = text.trim(); if (!t)
         return; const n = [{ id: Date.now(), text: t, done: false }, ...shopping]; setShopping(n); store.set("gymtracker:shopping", n); }
     function toggleShop(id) { const n = shopping.map(x => x.id === id ? { ...x, done: !x.done } : x); setShopping(n); store.set("gymtracker:shopping", n); }
-    function deleteShop(id) { const n = shopping.filter(x => x.id !== id); setShopping(n); store.set("gymtracker:shopping", n); }
-    function clearChecked() { const n = shopping.filter(x => !x.done); setShopping(n); store.set("gymtracker:shopping", n); }
+    function deleteShop(id) { ask("Dit product verwijderen?", () => { const n = shopping.filter(x => x.id !== id); setShopping(n); store.set("gymtracker:shopping", n); }); }
+    function clearChecked() { const done = shopping.filter(x => x.done).length; if (!done)
+        return; ask(`${done} afgevinkte ${done === 1 ? "product" : "producten"} wissen?`, () => { const n = shopping.filter(x => !x.done); setShopping(n); store.set("gymtracker:shopping", n); }, "Wissen"); }
     function addReminder(text, due) { const t = text.trim(); if (!t)
         return; const n = [{ id: Date.now(), text: t, created: today(), due: due || null, done: false, completed: null }, ...reminders]; setReminders(n); store.set("gymtracker:reminders", n); }
     function toggleReminder(id) { const n = reminders.map(x => x.id === id ? { ...x, done: !x.done, completed: !x.done ? today() : null } : x); setReminders(n); store.set("gymtracker:reminders", n); }
-    function deleteReminder(id) { const n = reminders.filter(x => x.id !== id); setReminders(n); store.set("gymtracker:reminders", n); }
+    function deleteReminder(id) { ask("Deze herinnering verwijderen?", () => { const n = reminders.filter(x => x.id !== id); setReminders(n); store.set("gymtracker:reminders", n); }); }
     function addNote() { const n = [{ id: Date.now(), text: "", updated: new Date().toISOString() }, ...notes]; setNotes(n); store.set("gymtracker:notes", n); }
     function updateNote(id, text) { const n = notes.map(x => x.id === id ? { ...x, text, updated: new Date().toISOString() } : x); setNotes(n); store.set("gymtracker:notes", n); }
-    function deleteNote(id) { const note = notes.find(x => x.id === id); if (note && note.text.trim()) {
-        let ok = true;
-        try {
-            ok = window.confirm("Deze notitie verwijderen?");
-        }
-        catch { }
-        if (!ok)
-            return;
-    } const n = notes.filter(x => x.id !== id); setNotes(n); store.set("gymtracker:notes", n); }
+    function deleteNote(id) { const doIt = () => { const n = notes.filter(x => x.id !== id); setNotes(n); store.set("gymtracker:notes", n); }; const note = notes.find(x => x.id === id); if (note && note.text.trim())
+        ask("Deze notitie verwijderen?", doIt);
+    else
+        doIt(); }
     function addBw() { const v = parseFloat(bwInput.replace(",", ".")); if (!v)
         return; const next = [...bw.filter(e => e.date !== today()), { date: today(), kg: v }].sort((a, b) => a.date.localeCompare(b.date)); setBw(next); store.set("gymtracker:bodyweight", next); setBwInput(""); toastMsg("Gewicht opgeslagen"); }
     function exportData() {
@@ -557,7 +555,7 @@ function App() {
     function toggleHabit(hid, d) { setHabits(p => { const day = { ...(p.log[d] || {}) }; day[hid] = !day[hid]; const n = { ...p, log: { ...p.log, [d]: day } }; store.set("gymtracker:habits", n); return n; }); }
     function addHabit(name) { const nm = name.trim(); if (!nm)
         return; setHabits(p => { const n = { ...p, list: [...p.list, { id: "h" + Date.now(), name: nm }] }; store.set("gymtracker:habits", n); return n; }); }
-    function removeHabit(hid) { setHabits(p => { const n = { ...p, list: p.list.filter(h => h.id !== hid) }; store.set("gymtracker:habits", n); return n; }); }
+    function removeHabit(hid) { const h = habits.list.find(x => x.id === hid); ask(h ? `Gewoonte "${h.name}" verwijderen?` : "Deze gewoonte verwijderen?", () => { setHabits(p => { const n = { ...p, list: p.list.filter(x => x.id !== hid) }; store.set("gymtracker:habits", n); return n; }); }); }
     const streakOf = useCallback((hid) => { var _a; let s = 0; for (let i = 0;; i++) {
         const d = new Date();
         d.setDate(d.getDate() - i);
@@ -650,6 +648,13 @@ function App() {
                     React.createElement("div", { style: { color: c.faint, fontSize: 11, marginTop: 4 } },
                         it.date ? new Date(it.date).toLocaleString("nl-NL", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "",
                         it.sha ? " · " + it.sha : ""))))))),
+        confirmBox && (React.createElement("div", { onClick: () => setConfirmBox(null), style: { position: "fixed", inset: 0, background: "rgba(8,10,14,.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 40, padding: 24 } },
+            React.createElement("div", { onClick: (e) => e.stopPropagation(), style: { width: "100%", maxWidth: 340, background: c.surface, border: `1px solid ${c.line}`, borderRadius: 16, padding: 20 } },
+                React.createElement("div", { style: { fontSize: 15, fontWeight: 600, color: c.text, marginBottom: 18, lineHeight: 1.45 } }, confirmBox.msg),
+                React.createElement("div", { style: { display: "flex", gap: 9 } },
+                    React.createElement("button", { onClick: () => setConfirmBox(null), style: { flex: 1, background: c.surfaceHi, color: c.text, border: `1px solid ${c.line}`, borderRadius: 10, padding: 12, cursor: "pointer", fontWeight: 600, fontSize: 13 } }, "Annuleren"),
+                    React.createElement("button", { onClick: () => { const f = confirmBox.onYes; setConfirmBox(null); if (f)
+                            f(); }, style: { flex: 1, background: "#e5484d", color: "#fff", border: "none", borderRadius: 10, padding: 12, cursor: "pointer", fontWeight: 700, fontSize: 13 } }, confirmBox.yes))))),
         toast && (React.createElement("div", { style: { position: "fixed", bottom: "calc(90px + env(safe-area-inset-bottom))", left: 0, right: 0, display: "flex", justifyContent: "center", pointerEvents: "none", zIndex: 30 } },
             React.createElement("div", { style: { background: c.accent, color: "#1a1500", fontWeight: 600, fontSize: 13, padding: "9px 16px", borderRadius: 999, boxShadow: "0 8px 24px rgba(0,0,0,.4)" } }, toast))),
         React.createElement("div", { style: { position: "fixed", bottom: 0, left: 0, right: 0, background: c.surface, borderTop: `1px solid ${c.line}`, display: "flex", padding: `8px 4px ${navPadBottom}`, zIndex: 10 } },
@@ -711,6 +716,7 @@ function TrainTab({ day, days, pickDay, order, draft, updateSet, stepSet, addSet
                 "D",
                 d));
         })),
+        React.createElement(RestTimer, null),
         React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 2 } },
             React.createElement("div", { style: { fontFamily: fDisp, fontSize: 22, fontWeight: 600 } }, PROGRAM[day].name),
             PROGRAM[day].optional && React.createElement("span", { style: { background: c.surfaceHi, color: c.faint, fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, padding: "2px 7px", borderRadius: 999 } }, "optioneel")),
@@ -753,6 +759,60 @@ function TrainTab({ day, days, pickDay, order, draft, updateSet, stepSet, addSet
             React.createElement("input", { value: customName, onChange: e => setCustomName(e.target.value), onKeyDown: e => e.key === "Enter" && addCustom(), placeholder: "+ eigen oefening", style: inputStyle(1) }),
             React.createElement("button", { onClick: addCustom, style: { background: c.surfaceHi, color: c.dim, border: `1px solid ${c.line}`, borderRadius: 10, padding: "0 14px", cursor: "pointer", fontWeight: 600, fontSize: 13 } }, "Toevoegen")),
         React.createElement("button", { onClick: saveWorkout, style: { width: "100%", background: c.accent, color: "#1a1500", border: "none", borderRadius: 14, padding: 15, cursor: "pointer", fontFamily: fDisp, fontWeight: 700, fontSize: 19, letterSpacing: 0.5 } }, "TRAINING OPSLAAN")));
+}
+function RestTimer() {
+    const PRESETS = [[60, "1:00"], [90, "1:30"], [120, "2:00"], [180, "3:00"]];
+    const [remaining, setRemaining] = useState(0);
+    const [running, setRunning] = useState(false);
+    const [finished, setFinished] = useState(false);
+    const [dur, setDur] = useState(90);
+    const endRef = useRef(0);
+    useEffect(() => {
+        if (!running)
+            return;
+        const tick = () => {
+            const rem = Math.max(0, Math.round((endRef.current - Date.now()) / 1000));
+            setRemaining(rem);
+            if (rem <= 0) {
+                setRunning(false);
+                setFinished(true);
+                try {
+                    if (navigator.vibrate)
+                        navigator.vibrate([200, 80, 200]);
+                }
+                catch (_) { }
+            }
+        };
+        tick();
+        const id = setInterval(tick, 250);
+        return () => clearInterval(id);
+    }, [running]); // no audio anywhere — silent by design
+    const startWith = (sec) => { setDur(sec); setFinished(false); endRef.current = Date.now() + sec * 1000; setRemaining(sec); setRunning(true); };
+    const toggle = () => { if (running) {
+        setRunning(false);
+    }
+    else if (remaining > 0) {
+        setFinished(false);
+        endRef.current = Date.now() + remaining * 1000;
+        setRunning(true);
+    }
+    else {
+        startWith(dur);
+    } };
+    const reset = () => { setRunning(false); setFinished(false); setRemaining(0); };
+    const secs = remaining > 0 ? remaining : (finished ? 0 : dur);
+    const timeStr = Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
+    return (React.createElement("div", { style: { background: c.surface, border: `1px solid ${finished ? c.accent : c.line}`, borderRadius: 14, padding: 12, marginBottom: 14 } },
+        React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 } },
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 9 } },
+                React.createElement("span", { style: { fontSize: 16 } }, "\u23F1\uFE0F"),
+                React.createElement("div", null,
+                    React.createElement("div", { style: { fontFamily: fDisp, fontSize: 26, fontWeight: 700, lineHeight: 1, color: finished ? c.accent : (running ? c.text : c.dim) } }, timeStr),
+                    React.createElement("div", { style: { color: finished ? c.accent : c.faint, fontSize: 10.5, marginTop: 3, textTransform: "uppercase", letterSpacing: 0.5 } }, finished ? "rust klaar ✓" : (running ? "rust loopt" : "rusttimer")))),
+            React.createElement("div", { style: { display: "flex", gap: 7 } },
+                React.createElement("button", { onClick: toggle, style: { background: running ? c.surfaceHi : c.accent, color: running ? c.text : "#1a1500", border: running ? `1px solid ${c.line}` : "none", borderRadius: 10, padding: "9px 15px", cursor: "pointer", fontWeight: 700, fontSize: 14 } }, running ? "❚❚" : "▶"),
+                React.createElement("button", { onClick: reset, style: { background: c.surfaceHi, color: c.dim, border: `1px solid ${c.line}`, borderRadius: 10, padding: "9px 13px", cursor: "pointer", fontWeight: 600, fontSize: 14 } }, "\u21BA"))),
+        React.createElement("div", { style: { display: "flex", gap: 6 } }, PRESETS.map(([sec, lbl]) => (React.createElement("button", { key: sec, onClick: () => startWith(sec), style: { flex: 1, background: dur === sec ? "rgba(245,185,59,.14)" : c.bg, color: dur === sec ? c.accent : c.dim, border: `1px solid ${dur === sec ? c.accent : c.line}`, borderRadius: 9, padding: "7px 0", cursor: "pointer", fontWeight: 600, fontSize: 12.5 } }, lbl))))));
 }
 function SetRow({ n, s, onW, onR, stepW, stepR }) {
     const done = s.w !== "" && s.r !== "";
