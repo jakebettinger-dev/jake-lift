@@ -132,6 +132,14 @@ function App() {
     const pushTimer = useRef(null);
     const pushing = useRef(false);
     const pushPending = useRef(false);
+    // --- extra feature state ---
+    const [exNotes, setExNotes] = useState(() => store.get("gymtracker:exnotes", {})); // per-exercise notes
+    const [exLibrary, setExLibrary] = useState(() => store.get("gymtracker:exlibrary", [])); // custom exercise library
+    const [dayExtras, setDayExtras] = useState(() => store.get("gymtracker:dayextras", {})); // {dayNum: [names]} added per day
+    const deletedRef = useRef(store.get("gymtracker:deleted", { notes: [], shopping: [], reminders: [], habits: [], workouts: [] }));
+    const [startedAt, setStartedAt] = useState(() => store.get("gymtracker:wstart", null)); // workout-duration start (ms)
+    const [rt, setRt] = useState({ remaining: 0, running: false, finished: false, dur: 90 }); // rest timer (App-level so it survives tab switches)
+    const rtEnd = useRef(0);
     const saveSync = (patch) => { const merged = { ...sync, ...patch }; setSync(merged); store.set("gymtracker:sync", merged); };
     useEffect(() => { if (!draft)
         initDay(1); }, []);
@@ -148,8 +156,12 @@ function App() {
     }
     function initDay(dn, src) {
         const list = src || workouts;
+        const extras = (dayExtras[dn] || []).map(nm => [nm, 3]); // custom exercises added to this day (3 sets default)
+        const specs = [...PROGRAM[dn].ex.map(e => [e[0], e[1]]), ...extras];
         const dr = {}, ord = [];
-        PROGRAM[dn].ex.forEach(([name, sets]) => {
+        specs.forEach(([name, sets]) => {
+            if (dr[name])
+                return; // skip duplicates (extra already in program)
             const prev = lastSessionSets(name, list);
             dr[name] = Array.from({ length: sets }, (_, i) => {
                 const p = prev ? (prev[i] || prev[prev.length - 1]) : null; // start from last time's weight/reps
@@ -168,8 +180,10 @@ function App() {
         initDay(1);
     } }
     function changeGoal(v) { const g = Math.max(500, Math.min(8000, v || 2500)); setWaterGoal(g); saveSettings({ waterGoal: g }); }
-    function updateSet(ex, i, f, val) { setDraft(p => { const n = { ...p, [ex]: p[ex].map((s, j) => j === i ? { ...s, [f]: val } : s) }; persistDraft(n, order); return n; }); }
-    function stepSet(ex, i, f, delta) { setDraft(p => { const cur = p[ex][i][f]; const base = cur === "" ? 0 : +cur; const val = Math.max(0, +(base + delta).toFixed(2)); const n = { ...p, [ex]: p[ex].map((s, j) => j === i ? { ...s, [f]: String(val) } : s) }; persistDraft(n, order); return n; }); }
+    function updateSet(ex, i, f, val) { if (f === "w" && val !== "")
+        startWorkoutClock(); setDraft(p => { const n = { ...p, [ex]: p[ex].map((s, j) => j === i ? { ...s, [f]: val } : s) }; persistDraft(n, order); return n; }); }
+    function stepSet(ex, i, f, delta) { if (f === "w")
+        startWorkoutClock(); setDraft(p => { const cur = p[ex][i][f]; const base = cur === "" ? 0 : +cur; const val = Math.max(0, +(base + delta).toFixed(2)); const n = { ...p, [ex]: p[ex].map((s, j) => j === i ? { ...s, [f]: String(val) } : s) }; persistDraft(n, order); return n; }); }
     function addSet(ex) { setDraft(p => { const n = { ...p, [ex]: [...p[ex], { w: "", r: "" }] }; persistDraft(n, order); return n; }); }
     function removeSet(ex) { setDraft(p => { if (p[ex].length <= 1)
         return p; const n = { ...p, [ex]: p[ex].slice(0, -1) }; persistDraft(n, order); return n; }); }
@@ -183,10 +197,12 @@ function App() {
             toastMsg("Log eerst minstens één set");
             return;
         }
-        const session = { id: Date.now(), date: today(), day, dayName: PROGRAM[day].name, exercises };
+        const durationSec = startedAt ? Math.round((Date.now() - startedAt) / 1000) : null;
+        const session = { id: Date.now(), date: today(), day, dayName: PROGRAM[day].name, exercises, durationSec };
         const next = [...workouts, session];
         setWorkouts(next);
         store.set("gymtracker:workouts", next);
+        stopWorkoutClock();
         initDay(day, next);
         toastMsg("Training opgeslagen 💪");
     }
@@ -194,21 +210,50 @@ function App() {
     function addShop(text) { const t = text.trim(); if (!t)
         return; const n = [{ id: Date.now(), text: t, done: false }, ...shopping]; setShopping(n); store.set("gymtracker:shopping", n); }
     function toggleShop(id) { const n = shopping.map(x => x.id === id ? { ...x, done: !x.done } : x); setShopping(n); store.set("gymtracker:shopping", n); }
-    function deleteShop(id) { ask("Dit product verwijderen?", () => { const n = shopping.filter(x => x.id !== id); setShopping(n); store.set("gymtracker:shopping", n); }); }
-    function clearChecked() { const done = shopping.filter(x => x.done).length; if (!done)
-        return; ask(`${done} afgevinkte ${done === 1 ? "product" : "producten"} wissen?`, () => { const n = shopping.filter(x => !x.done); setShopping(n); store.set("gymtracker:shopping", n); }, "Wissen"); }
+    function deleteShop(id) { ask("Dit product verwijderen?", () => { markDeleted("shopping", id); const n = shopping.filter(x => x.id !== id); setShopping(n); store.set("gymtracker:shopping", n); }); }
+    function clearChecked() { const done = shopping.filter(x => x.done); if (!done.length)
+        return; ask(`${done.length} afgevinkte ${done.length === 1 ? "product" : "producten"} wissen?`, () => { done.forEach(x => markDeleted("shopping", x.id)); const n = shopping.filter(x => !x.done); setShopping(n); store.set("gymtracker:shopping", n); }, "Wissen"); }
     function addReminder(text, due) { const t = text.trim(); if (!t)
         return; const n = [{ id: Date.now(), text: t, created: today(), due: due || null, done: false, completed: null }, ...reminders]; setReminders(n); store.set("gymtracker:reminders", n); }
     function toggleReminder(id) { const n = reminders.map(x => x.id === id ? { ...x, done: !x.done, completed: !x.done ? today() : null } : x); setReminders(n); store.set("gymtracker:reminders", n); }
-    function deleteReminder(id) { ask("Deze herinnering verwijderen?", () => { const n = reminders.filter(x => x.id !== id); setReminders(n); store.set("gymtracker:reminders", n); }); }
+    function deleteReminder(id) { ask("Deze herinnering verwijderen?", () => { markDeleted("reminders", id); const n = reminders.filter(x => x.id !== id); setReminders(n); store.set("gymtracker:reminders", n); }); }
     function addNote() { const n = [{ id: Date.now(), text: "", updated: new Date().toISOString() }, ...notes]; setNotes(n); store.set("gymtracker:notes", n); }
     function updateNote(id, text) { const n = notes.map(x => x.id === id ? { ...x, text, updated: new Date().toISOString() } : x); setNotes(n); store.set("gymtracker:notes", n); }
-    function deleteNote(id) { const doIt = () => { const n = notes.filter(x => x.id !== id); setNotes(n); store.set("gymtracker:notes", n); }; const note = notes.find(x => x.id === id); if (note && note.text.trim())
+    function deleteNote(id) { const doIt = () => { markDeleted("notes", id); const n = notes.filter(x => x.id !== id); setNotes(n); store.set("gymtracker:notes", n); }; const note = notes.find(x => x.id === id); if (note && note.text.trim())
         ask("Deze notitie verwijderen?", doIt);
     else
         doIt(); }
     function addBw() { const v = parseFloat(bwInput.replace(",", ".")); if (!v)
         return; const next = [...bw.filter(e => e.date !== today()), { date: today(), kg: v }].sort((a, b) => a.date.localeCompare(b.date)); setBw(next); store.set("gymtracker:bodyweight", next); setBwInput(""); toastMsg("Gewicht opgeslagen"); }
+    // ---- workout duration clock ----
+    const startWorkoutClock = () => { setStartedAt(p => { if (p)
+        return p; const t = Date.now(); store.set("gymtracker:wstart", t); return t; }); };
+    const stopWorkoutClock = () => { setStartedAt(null); store.set("gymtracker:wstart", null); };
+    // ---- rest timer controls (state lives in App) ----
+    const rtStart = (sec) => { rtEnd.current = Date.now() + sec * 1000; setRt({ remaining: sec, running: true, finished: false, dur: sec }); };
+    const rtToggle = () => { setRt(p => { if (p.running)
+        return { ...p, running: false }; if (p.remaining > 0) {
+        rtEnd.current = Date.now() + p.remaining * 1000;
+        return { ...p, running: true, finished: false };
+    } rtEnd.current = Date.now() + p.dur * 1000; return { remaining: p.dur, running: true, finished: false, dur: p.dur }; }); };
+    const rtReset = () => setRt(p => ({ ...p, running: false, finished: false, remaining: 0 }));
+    // ---- deletion tombstones (so deletes propagate through the union-merge) ----
+    function markDeleted(coll, id) { const d = deletedRef.current; if (!d[coll])
+        d[coll] = []; if (!d[coll].includes(id)) {
+        d[coll].push(id);
+        store.set("gymtracker:deleted", d);
+    } }
+    // ---- per-exercise notes ----
+    function setExNote(ex, text) { setExNotes(p => { const n = { ...p, [ex]: text }; store.set("gymtracker:exnotes", n); return n; }); }
+    // ---- custom exercise library + per-day extras ----
+    function addLibraryEx(name) { const nm = (name || "").trim(); if (!nm)
+        return; setExLibrary(p => { if (p.some(x => x.toLowerCase() === nm.toLowerCase()))
+        return p; const n = [...p, nm]; store.set("gymtracker:exlibrary", n); return n; }); }
+    function removeLibraryEx(name) { ask(`"${name}" uit de oefeningenlijst verwijderen?`, () => { setExLibrary(p => { const n = p.filter(x => x !== name); store.set("gymtracker:exlibrary", n); return n; }); }); }
+    function addExerciseToDay(name) { const nm = (name || "").trim(); if (!nm || order.includes(nm))
+        return; setDayExtras(p => { const arr = p[day] || []; if (arr.includes(nm))
+        return p; const n = { ...p, [day]: [...arr, nm] }; store.set("gymtracker:dayextras", n); return n; }); const prev = lastSessionSets(nm); const slots = Array.from({ length: 3 }, (_, i) => { const pp = prev ? (prev[i] || prev[prev.length - 1]) : null; return pp ? { w: String(pp.w), r: String(pp.r) } : { w: "", r: "" }; }); const nd = { ...draft, [nm]: slots }, no = [...order, nm]; setDraft(nd); setOrder(no); persistDraft(nd, no); }
+    function removeExerciseFromDay(name) { ask(`Oefening "${name}" van deze dag verwijderen?`, () => { setDayExtras(p => { const arr = (p[day] || []).filter(x => x !== name); const n = { ...p, [day]: arr }; store.set("gymtracker:dayextras", n); return n; }); const no = order.filter(x => x !== name); setOrder(no); setDraft(p => { const cp = { ...p }; delete cp[name]; persistDraft(cp, no); return cp; }); }); }
     function exportData() {
         const payload = { app: "jake-lift", version: 2, exported: new Date().toISOString(), workouts, habits, bodyweight: bw, notes, water, shopping, reminders, settings: { extraDays, waterGoal } };
         const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -283,7 +328,7 @@ function App() {
         reader.readAsText(file);
     }
     /* ---- GitHub sync ---- */
-    function collectData() { return { app: "jake-lift", version: 2, savedAt: Date.now(), workouts, habits, bodyweight: bw, notes, water, shopping, reminders, settings: { extraDays, waterGoal } }; }
+    function collectData() { return { app: "jake-lift", version: 2, savedAt: Date.now(), workouts, habits, bodyweight: bw, notes, water, shopping, reminders, settings: { extraDays, waterGoal }, exNotes, exLibrary, dayExtras, deleted: deletedRef.current, sess: { day, draft, order } }; }
     // Merge local + remote so nothing added on any device is lost. Union by id/date;
     // on a real conflict the newer save (higher savedAt) wins.
     function mergeData(local, remote) {
@@ -295,17 +340,31 @@ function App() {
         const byDate = (a, b) => { const m = new Map(); const [o, n] = rNew ? [a || [], b || []] : [b || [], a || []]; [...o, ...n].forEach(it => { if (it && it.date != null)
             m.set(it.date, it); }); return [...m.values()].sort((x, y) => String(x.date).localeCompare(String(y.date))); };
         const objMerge = (a, b) => { const [o, n] = rNew ? [a || {}, b || {}] : [b || {}, a || {}]; return { ...o, ...n }; };
+        const arrUnion = (a, b) => [...new Set([...(a || []), ...(b || [])])];
         const lh = local.habits || { list: [], log: {} }, rh = remote.habits || { list: [], log: {} };
+        // union deletion tombstones, then filter every collection so deletes stick across devices
+        const ld = local.deleted || {}, rd = remote.deleted || {};
+        const del = { notes: arrUnion(ld.notes, rd.notes), shopping: arrUnion(ld.shopping, rd.shopping), reminders: arrUnion(ld.reminders, rd.reminders), habits: arrUnion(ld.habits, rd.habits), workouts: arrUnion(ld.workouts, rd.workouts) };
+        const notDel = (arr, k) => arr.filter(x => !del[k].includes(x.id));
+        // per-day extras: union each day's exercise list
+        const lde = local.dayExtras || {}, rde = remote.dayExtras || {};
+        const dayExtrasMerged = {};
+        [...new Set([...Object.keys(lde), ...Object.keys(rde)])].forEach(k => { dayExtrasMerged[k] = arrUnion(lde[k], rde[k]); });
         return {
             app: "jake-lift", version: 2, savedAt: Math.max(local.savedAt || 0, remote.savedAt || 0),
-            workouts: byId(local.workouts, remote.workouts),
-            habits: { list: byId(lh.list, rh.list), log: objMerge(lh.log, rh.log) },
+            workouts: notDel(byId(local.workouts, remote.workouts), "workouts"),
+            habits: { list: notDel(byId(lh.list, rh.list), "habits"), log: objMerge(lh.log, rh.log) },
             bodyweight: byDate(local.bodyweight, remote.bodyweight),
-            notes: byId(local.notes, remote.notes),
+            notes: notDel(byId(local.notes, remote.notes), "notes"),
             water: objMerge(local.water, remote.water),
-            shopping: byId(local.shopping, remote.shopping),
-            reminders: byId(local.reminders, remote.reminders),
+            shopping: notDel(byId(local.shopping, remote.shopping), "shopping"),
+            reminders: notDel(byId(local.reminders, remote.reminders), "reminders"),
             settings: rNew ? (remote.settings || local.settings) : (local.settings || remote.settings),
+            exNotes: objMerge(local.exNotes, remote.exNotes),
+            exLibrary: arrUnion(local.exLibrary, remote.exLibrary),
+            dayExtras: dayExtrasMerged,
+            deleted: del,
+            sess: rNew ? (remote.sess || local.sess) : (local.sess || remote.sess),
         };
     }
     const noTs = (o) => { if (!o)
@@ -342,6 +401,10 @@ function App() {
             parts.push("Gewoontes bijgewerkt");
         if (JSON.stringify(oldD.settings || {}) !== JSON.stringify(neu.settings || {}))
             parts.push("Instellingen bijgewerkt");
+        if (JSON.stringify(oldD.exNotes || {}) !== JSON.stringify(neu.exNotes || {}))
+            parts.push("Oefening-notitie bijgewerkt");
+        if (JSON.stringify((oldD.sess || {}).draft || {}) !== JSON.stringify((neu.sess || {}).draft || {}) && nw.length <= ow.length)
+            parts.push("Training bijgewerkt (bezig)");
         return parts.length ? parts.join(" · ") : "Data bijgewerkt";
     }
     function applyData(d) {
@@ -378,6 +441,28 @@ function App() {
             setExtraDays(!!d.settings.extraDays);
             setWaterGoal(d.settings.waterGoal || 2500);
             store.set("gymtracker:settings", d.settings);
+        }
+        if (d.exNotes && typeof d.exNotes === "object") {
+            setExNotes(d.exNotes);
+            store.set("gymtracker:exnotes", d.exNotes);
+        }
+        if (Array.isArray(d.exLibrary)) {
+            setExLibrary(d.exLibrary);
+            store.set("gymtracker:exlibrary", d.exLibrary);
+        }
+        if (d.dayExtras && typeof d.dayExtras === "object") {
+            setDayExtras(d.dayExtras);
+            store.set("gymtracker:dayextras", d.dayExtras);
+        }
+        if (d.deleted && typeof d.deleted === "object") {
+            deletedRef.current = d.deleted;
+            store.set("gymtracker:deleted", d.deleted);
+        }
+        if (d.sess && d.sess.draft && JSON.stringify(d.sess) !== JSON.stringify({ day, draft, order })) {
+            setDay(d.sess.day || 1);
+            setDraft(d.sess.draft);
+            setOrder(d.sess.order || []);
+            store.set("gymtracker:draft", { day: d.sess.day, draft: d.sess.draft, order: d.sess.order });
         }
     }
     const b64encode = (s) => btoa(unescape(encodeURIComponent(s)));
@@ -537,7 +622,22 @@ function App() {
         pushTimer.current = setTimeout(() => { pushToGitHub(true); }, 2500);
         return () => { if (pushTimer.current)
             clearTimeout(pushTimer.current); };
-    }, [workouts, habits, bw, notes, water, shopping, reminders, extraDays, waterGoal, sync.auto]);
+    }, [workouts, habits, bw, notes, water, shopping, reminders, extraDays, waterGoal, draft, exNotes, exLibrary, dayExtras, sync.auto]);
+    // App-level rest-timer interval — keeps counting even when another tab is shown
+    useEffect(() => {
+        if (!rt.running)
+            return;
+        const tick = () => { const rem = Math.max(0, Math.round((rtEnd.current - Date.now()) / 1000)); setRt(p => ({ ...p, remaining: rem, running: rem > 0, finished: rem <= 0 })); if (rem <= 0) {
+            try {
+                if (navigator.vibrate)
+                    navigator.vibrate([200, 80, 200]);
+            }
+            catch (_) { }
+        } };
+        tick();
+        const id = setInterval(tick, 250);
+        return () => clearInterval(id);
+    }, [rt.running]);
     const lastSessionTop = useCallback((ex) => { for (let i = workouts.length - 1; i >= 0; i--) {
         const f = workouts[i].exercises.find(e => e.name === ex);
         if (f)
@@ -555,7 +655,7 @@ function App() {
     function toggleHabit(hid, d) { setHabits(p => { const day = { ...(p.log[d] || {}) }; day[hid] = !day[hid]; const n = { ...p, log: { ...p.log, [d]: day } }; store.set("gymtracker:habits", n); return n; }); }
     function addHabit(name) { const nm = name.trim(); if (!nm)
         return; setHabits(p => { const n = { ...p, list: [...p.list, { id: "h" + Date.now(), name: nm }] }; store.set("gymtracker:habits", n); return n; }); }
-    function removeHabit(hid) { const h = habits.list.find(x => x.id === hid); ask(h ? `Gewoonte "${h.name}" verwijderen?` : "Deze gewoonte verwijderen?", () => { setHabits(p => { const n = { ...p, list: p.list.filter(x => x.id !== hid) }; store.set("gymtracker:habits", n); return n; }); }); }
+    function removeHabit(hid) { const h = habits.list.find(x => x.id === hid); ask(h ? `Gewoonte "${h.name}" verwijderen?` : "Deze gewoonte verwijderen?", () => { markDeleted("habits", hid); setHabits(p => { const n = { ...p, list: p.list.filter(x => x.id !== hid) }; store.set("gymtracker:habits", n); return n; }); }); }
     const streakOf = useCallback((hid) => { var _a; let s = 0; for (let i = 0;; i++) {
         const d = new Date();
         d.setDate(d.getDate() - i);
@@ -587,7 +687,7 @@ function App() {
         React.createElement("div", { style: { padding: `16px 14px calc(96px + env(safe-area-inset-bottom))`, minHeight: 380 } },
             tab === "train" && React.createElement(React.Fragment, null,
                 React.createElement(WaterCard, { ml: waterToday, goal: waterGoal, addWater: addWater }),
-                React.createElement(TrainTab, { day: day, days: days, pickDay: pickDay, order: order, draft: draft, updateSet: updateSet, stepSet: stepSet, addSet: addSet, removeSet: removeSet, lastSessionTop: lastSessionTop, bestEver: bestEver, customName: customName, setCustomName: setCustomName, addCustom: addCustom, saveWorkout: saveWorkout })),
+                React.createElement(TrainTab, { day: day, days: days, pickDay: pickDay, order: order, draft: draft, updateSet: updateSet, stepSet: stepSet, addSet: addSet, removeSet: removeSet, lastSessionTop: lastSessionTop, bestEver: bestEver, saveWorkout: saveWorkout, exNotes: exNotes, setExNote: setExNote, exLibrary: exLibrary, addExerciseToDay: addExerciseToDay, removeExerciseFromDay: removeExerciseFromDay, extras: dayExtras[day] || [], rt: rt, rtStart: rtStart, rtToggle: rtToggle, rtReset: rtReset, startedAt: startedAt, stopWorkoutClock: stopWorkoutClock })),
             tab === "progress" && React.createElement(ProgressTab, { workouts: workouts, bw: bw, bwInput: bwInput, setBwInput: setBwInput, addBw: addBw }),
             tab === "calendar" && React.createElement(CalendarTab, { workouts: workouts, water: water, reminders: reminders, habits: habits, waterGoal: waterGoal }),
             tab === "lists" && React.createElement(ListsTab, { notes: notes, addNote: addNote, updateNote: updateNote, deleteNote: deleteNote, shopping: shopping, addShop: addShop, toggleShop: toggleShop, deleteShop: deleteShop, clearChecked: clearChecked, reminders: reminders, addReminder: addReminder, toggleReminder: toggleReminder, deleteReminder: deleteReminder }),
@@ -607,6 +707,18 @@ function App() {
                         React.createElement("div", { style: { fontWeight: 600, fontSize: 14 } }, "Water-doel per dag"),
                         React.createElement("div", { style: { color: c.faint, fontSize: 11.5, marginTop: 2 } }, "In milliliter")),
                     React.createElement("input", { value: waterGoal, onChange: (e) => changeGoal(parseInt(e.target.value.replace(/\D/g, "")) || 0), inputMode: "numeric", style: { width: 90, textAlign: "center", background: c.surfaceHi, color: c.text, border: `1px solid ${c.line}`, borderRadius: 10, height: 38, fontFamily: fDisp, fontSize: 17, fontWeight: 600, outline: "none" } })),
+                React.createElement("div", { style: { background: c.bg, border: `1px solid ${c.line}`, borderRadius: 12, padding: 14, marginBottom: 12 } },
+                    React.createElement("div", { style: { fontWeight: 600, fontSize: 14, marginBottom: 3 } }, "Eigen oefeningen"),
+                    React.createElement("div", { style: { color: c.faint, fontSize: 11.5, marginBottom: 12, lineHeight: 1.5 } }, "Voeg oefeningen toe die je per trainingsdag via de dropdown kunt kiezen."),
+                    React.createElement("div", { style: { display: "flex", gap: 8 } },
+                        React.createElement("input", { value: customName, onChange: e => setCustomName(e.target.value), onKeyDown: e => { if (e.key === "Enter") {
+                                addLibraryEx(customName);
+                                setCustomName("");
+                            } }, placeholder: "Naam van oefening", style: { ...inputStyle(1), width: "100%" } }),
+                        React.createElement("button", { onClick: () => { addLibraryEx(customName); setCustomName(""); }, style: { background: c.accent, color: "#1a1500", border: "none", borderRadius: 10, padding: "0 16px", cursor: "pointer", fontWeight: 700, fontSize: 15 } }, "+")),
+                    exLibrary.map(nm => (React.createElement("div", { key: nm, style: { display: "flex", alignItems: "center", justifyContent: "space-between", background: c.surface, border: `1px solid ${c.line}`, borderRadius: 9, padding: "8px 12px", marginTop: 8 } },
+                        React.createElement("span", { style: { fontSize: 13 } }, nm),
+                        React.createElement("button", { onClick: () => removeLibraryEx(nm), style: { background: "none", border: "none", color: c.faint, cursor: "pointer", fontSize: 14 } }, "\uD83D\uDDD1"))))),
                 React.createElement("div", { style: { background: c.bg, border: `1px solid ${c.line}`, borderRadius: 12, padding: 14, marginBottom: 12 } },
                     React.createElement("div", { style: { fontWeight: 600, fontSize: 14, marginBottom: 3 } }, "Synchroniseren via GitHub"),
                     React.createElement("div", { style: { color: c.faint, fontSize: 11.5, marginBottom: 10, lineHeight: 1.5 } }, "Sla je data op in een priv\u00E9 GitHub-repo om hem op meerdere apparaten te gebruiken. Je token blijft alleen op dit apparaat."),
@@ -681,10 +793,11 @@ function WaterCard({ ml, goal, addWater }) {
                     " ml"))),
         React.createElement("div", { style: { height: 9, background: c.bg, borderRadius: 999, overflow: "hidden", marginBottom: 12 } },
             React.createElement("div", { style: { width: `${pct}%`, height: "100%", background: c.water, borderRadius: 999, transition: "width .25s" } })),
-        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8 } },
-            React.createElement("button", { onClick: () => addWater(250), style: waterBtn }, "+ Glas 250"),
-            React.createElement("button", { onClick: () => addWater(500), style: waterBtn }, "+ Fles 500"),
-            React.createElement("button", { onClick: () => addWater(-250), style: { width: 42, background: c.bg, color: c.dim, border: `1px solid ${c.line}`, borderRadius: 10, padding: "10px 0", cursor: "pointer", fontSize: 15 } }, "\u2212")),
+        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 7 } },
+            React.createElement("button", { onClick: () => addWater(125), style: waterBtn }, "+ 125"),
+            React.createElement("button", { onClick: () => addWater(250), style: waterBtn }, "+ 250"),
+            React.createElement("button", { onClick: () => addWater(500), style: waterBtn }, "+ 500"),
+            React.createElement("button", { onClick: () => addWater(-125), style: { width: 40, background: c.bg, color: c.dim, border: `1px solid ${c.line}`, borderRadius: 10, padding: "10px 0", cursor: "pointer", fontSize: 15 } }, "\u2212")),
         React.createElement("div", { style: { color: c.faint, fontSize: 11, marginTop: 8 } },
             pct,
             "% van je doel \u00B7 ",
@@ -708,7 +821,8 @@ function WeekBadge({ count, vol }) {
             " kg volume"));
 }
 /* ================= TRAIN ================= */
-function TrainTab({ day, days, pickDay, order, draft, updateSet, stepSet, addSet, removeSet, lastSessionTop, bestEver, customName, setCustomName, addCustom, saveWorkout }) {
+function TrainTab({ day, days, pickDay, order, draft, updateSet, stepSet, addSet, removeSet, lastSessionTop, bestEver, saveWorkout, exNotes, setExNote, exLibrary, addExerciseToDay, removeExerciseFromDay, extras, rt, rtStart, rtToggle, rtReset, startedAt, stopWorkoutClock }) {
+    const libOptions = exLibrary.filter(nm => !order.includes(nm));
     return (React.createElement("div", null,
         React.createElement("div", { style: { display: "grid", gridTemplateColumns: `repeat(${days.length},1fr)`, gap: 7, marginBottom: 16 } }, days.map(d => {
             const on = day === d, opt = PROGRAM[d].optional;
@@ -716,7 +830,8 @@ function TrainTab({ day, days, pickDay, order, draft, updateSet, stepSet, addSet
                 "D",
                 d));
         })),
-        React.createElement(RestTimer, null),
+        React.createElement(WorkoutClock, { startedAt: startedAt, onStop: stopWorkoutClock }),
+        React.createElement(RestTimer, { rt: rt, start: rtStart, toggle: rtToggle, reset: rtReset }),
         React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 8, marginBottom: 2 } },
             React.createElement("div", { style: { fontFamily: fDisp, fontSize: 22, fontWeight: 600 } }, PROGRAM[day].name),
             PROGRAM[day].optional && React.createElement("span", { style: { background: c.surfaceHi, color: c.faint, fontSize: 9.5, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5, padding: "2px 7px", borderRadius: 999 } }, "optioneel")),
@@ -726,6 +841,7 @@ function TrainTab({ day, days, pickDay, order, draft, updateSet, stepSet, addSet
         order.map(ex => {
             const prog = PROGRAM[day].ex.find(e => e[0] === ex);
             const target = prog ? prog[2] : null;
+            const isExtra = (extras || []).includes(ex);
             const prev = lastSessionTop(ex), best = bestEver(ex), cur = topSet(draft[ex]);
             let flag = null;
             if (cur && prev) {
@@ -747,72 +863,54 @@ function TrainTab({ day, days, pickDay, order, draft, updateSet, stepSet, addSet
                                     prev.w,
                                     "kg \u00D7 ",
                                     prev.r)))),
-                    isPR ? React.createElement("span", { style: { background: "rgba(245,185,59,.14)", color: c.accent, fontSize: 10.5, fontWeight: 700, padding: "3px 8px", borderRadius: 999 } }, "\uD83C\uDFC6 PR")
-                        : flag === "beat" ? React.createElement("span", { style: { background: "rgba(52,211,153,.14)", color: c.good, fontSize: 10.5, fontWeight: 700, padding: "3px 8px", borderRadius: 999 } }, "\u25B2 beter")
-                            : flag === "match" ? React.createElement("span", { style: { color: c.dim, fontSize: 10.5, fontWeight: 600 } }, "= vorige") : null),
+                    React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 6 } },
+                        isPR ? React.createElement("span", { style: { background: "rgba(245,185,59,.14)", color: c.accent, fontSize: 10.5, fontWeight: 700, padding: "3px 8px", borderRadius: 999 } }, "\uD83C\uDFC6 PR")
+                            : flag === "beat" ? React.createElement("span", { style: { background: "rgba(52,211,153,.14)", color: c.good, fontSize: 10.5, fontWeight: 700, padding: "3px 8px", borderRadius: 999 } }, "\u25B2 beter")
+                                : flag === "match" ? React.createElement("span", { style: { color: c.dim, fontSize: 10.5, fontWeight: 600 } }, "= vorige") : null,
+                        isExtra && React.createElement("button", { onClick: () => removeExerciseFromDay(ex), title: "Oefening verwijderen", style: { background: "none", border: "none", color: c.faint, cursor: "pointer", fontSize: 15, lineHeight: 1, padding: 2 } }, "\u2715"))),
                 draft[ex].map((s, i) => React.createElement(SetRow, { key: i, n: i + 1, s: s, onW: v => updateSet(ex, i, "w", v), onR: v => updateSet(ex, i, "r", v), stepW: d => stepSet(ex, i, "w", d), stepR: d => stepSet(ex, i, "r", d) })),
                 React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 8 } },
                     React.createElement(MiniBtn, { onClick: () => addSet(ex) }, "+ set"),
-                    draft[ex].length > 1 && React.createElement(MiniBtn, { onClick: () => removeSet(ex), dim: true }, "\u2212 set"))));
+                    draft[ex].length > 1 && React.createElement(MiniBtn, { onClick: () => removeSet(ex), dim: true }, "\u2212 set")),
+                React.createElement("input", { value: exNotes[ex] || "", onChange: e => setExNote(ex, e.target.value), placeholder: "\uD83D\uDCDD Notitie (bijv. stand 4, zitting 2)", style: { width: "100%", marginTop: 9, background: c.bg, color: c.text, border: `1px solid ${c.line}`, borderRadius: 9, padding: "8px 10px", fontSize: 12.5, fontFamily: fBody, outline: "none" } })));
         }),
-        React.createElement("div", { style: { display: "flex", gap: 8, marginTop: 4, marginBottom: 18 } },
-            React.createElement("input", { value: customName, onChange: e => setCustomName(e.target.value), onKeyDown: e => e.key === "Enter" && addCustom(), placeholder: "+ eigen oefening", style: inputStyle(1) }),
-            React.createElement("button", { onClick: addCustom, style: { background: c.surfaceHi, color: c.dim, border: `1px solid ${c.line}`, borderRadius: 10, padding: "0 14px", cursor: "pointer", fontWeight: 600, fontSize: 13 } }, "Toevoegen")),
+        exLibrary.length > 0 ? (React.createElement("select", { value: "", onChange: e => { const v = e.target.value; if (v)
+                addExerciseToDay(v); e.target.value = ""; }, style: { width: "100%", marginTop: 4, marginBottom: 18, background: c.surfaceHi, color: libOptions.length ? c.text : c.faint, border: `1px solid ${c.line}`, borderRadius: 10, padding: "12px 12px", fontSize: 13.5, fontWeight: 600, appearance: "none" } },
+            React.createElement("option", { value: "" }, libOptions.length ? "+ Oefening toevoegen…" : "Alle eigen oefeningen staan al in deze dag"),
+            libOptions.map(nm => React.createElement("option", { key: nm, value: nm }, nm)))) : (React.createElement("div", { style: { color: c.faint, fontSize: 11.5, textAlign: "center", marginTop: 4, marginBottom: 18, lineHeight: 1.5 } }, "Eigen oefeningen toevoegen? Beheer de lijst in \u2699\uFE0F Instellingen \u2192 Eigen oefeningen.")),
         React.createElement("button", { onClick: saveWorkout, style: { width: "100%", background: c.accent, color: "#1a1500", border: "none", borderRadius: 14, padding: 15, cursor: "pointer", fontFamily: fDisp, fontWeight: 700, fontSize: 19, letterSpacing: 0.5 } }, "TRAINING OPSLAAN")));
 }
-function RestTimer() {
+function WorkoutClock({ startedAt, onStop }) {
+    const [nowMs, setNowMs] = useState(Date.now());
+    useEffect(() => { if (!startedAt)
+        return; const id = setInterval(() => setNowMs(Date.now()), 1000); return () => clearInterval(id); }, [startedAt]);
+    if (!startedAt)
+        return null;
+    const s = Math.max(0, Math.round((nowMs - startedAt) / 1000));
+    const t = Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+    return (React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", background: c.surface, border: `1px solid ${c.good}`, borderRadius: 12, padding: "10px 13px", marginBottom: 12 } },
+        React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 9 } },
+            React.createElement("span", { style: { fontSize: 15 } }, "\uD83C\uDFCB\uFE0F"),
+            React.createElement("div", null,
+                React.createElement("div", { style: { fontFamily: fDisp, fontSize: 21, fontWeight: 700, lineHeight: 1, color: c.good } }, t),
+                React.createElement("div", { style: { color: c.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, marginTop: 2 } }, "workoutduur"))),
+        React.createElement("button", { onClick: onStop, style: { background: c.surfaceHi, color: c.dim, border: `1px solid ${c.line}`, borderRadius: 9, padding: "7px 13px", cursor: "pointer", fontWeight: 600, fontSize: 12 } }, "\u25A0 Stop")));
+}
+function RestTimer({ rt, start, toggle, reset }) {
     const PRESETS = [[60, "1:00"], [90, "1:30"], [120, "2:00"], [180, "3:00"]];
-    const [remaining, setRemaining] = useState(0);
-    const [running, setRunning] = useState(false);
-    const [finished, setFinished] = useState(false);
-    const [dur, setDur] = useState(90);
-    const endRef = useRef(0);
-    useEffect(() => {
-        if (!running)
-            return;
-        const tick = () => {
-            const rem = Math.max(0, Math.round((endRef.current - Date.now()) / 1000));
-            setRemaining(rem);
-            if (rem <= 0) {
-                setRunning(false);
-                setFinished(true);
-                try {
-                    if (navigator.vibrate)
-                        navigator.vibrate([200, 80, 200]);
-                }
-                catch (_) { }
-            }
-        };
-        tick();
-        const id = setInterval(tick, 250);
-        return () => clearInterval(id);
-    }, [running]); // no audio anywhere — silent by design
-    const startWith = (sec) => { setDur(sec); setFinished(false); endRef.current = Date.now() + sec * 1000; setRemaining(sec); setRunning(true); };
-    const toggle = () => { if (running) {
-        setRunning(false);
-    }
-    else if (remaining > 0) {
-        setFinished(false);
-        endRef.current = Date.now() + remaining * 1000;
-        setRunning(true);
-    }
-    else {
-        startWith(dur);
-    } };
-    const reset = () => { setRunning(false); setFinished(false); setRemaining(0); };
-    const secs = remaining > 0 ? remaining : (finished ? 0 : dur);
+    const secs = rt.remaining > 0 ? rt.remaining : (rt.finished ? 0 : rt.dur);
     const timeStr = Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
-    return (React.createElement("div", { style: { background: c.surface, border: `1px solid ${finished ? c.accent : c.line}`, borderRadius: 14, padding: 12, marginBottom: 14 } },
+    return (React.createElement("div", { style: { background: c.surface, border: `1px solid ${rt.finished ? c.accent : c.line}`, borderRadius: 14, padding: 12, marginBottom: 14 } },
         React.createElement("div", { style: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 } },
             React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 9 } },
                 React.createElement("span", { style: { fontSize: 16 } }, "\u23F1\uFE0F"),
                 React.createElement("div", null,
-                    React.createElement("div", { style: { fontFamily: fDisp, fontSize: 26, fontWeight: 700, lineHeight: 1, color: finished ? c.accent : (running ? c.text : c.dim) } }, timeStr),
-                    React.createElement("div", { style: { color: finished ? c.accent : c.faint, fontSize: 10.5, marginTop: 3, textTransform: "uppercase", letterSpacing: 0.5 } }, finished ? "rust klaar ✓" : (running ? "rust loopt" : "rusttimer")))),
+                    React.createElement("div", { style: { fontFamily: fDisp, fontSize: 26, fontWeight: 700, lineHeight: 1, color: rt.finished ? c.accent : (rt.running ? c.text : c.dim) } }, timeStr),
+                    React.createElement("div", { style: { color: rt.finished ? c.accent : c.faint, fontSize: 10.5, marginTop: 3, textTransform: "uppercase", letterSpacing: 0.5 } }, rt.finished ? "rust klaar ✓" : (rt.running ? "rust loopt" : "rusttimer")))),
             React.createElement("div", { style: { display: "flex", gap: 7 } },
-                React.createElement("button", { onClick: toggle, style: { background: running ? c.surfaceHi : c.accent, color: running ? c.text : "#1a1500", border: running ? `1px solid ${c.line}` : "none", borderRadius: 10, padding: "9px 15px", cursor: "pointer", fontWeight: 700, fontSize: 14 } }, running ? "❚❚" : "▶"),
+                React.createElement("button", { onClick: toggle, style: { background: rt.running ? c.surfaceHi : c.accent, color: rt.running ? c.text : "#1a1500", border: rt.running ? `1px solid ${c.line}` : "none", borderRadius: 10, padding: "9px 15px", cursor: "pointer", fontWeight: 700, fontSize: 14 } }, rt.running ? "❚❚" : "▶"),
                 React.createElement("button", { onClick: reset, style: { background: c.surfaceHi, color: c.dim, border: `1px solid ${c.line}`, borderRadius: 10, padding: "9px 13px", cursor: "pointer", fontWeight: 600, fontSize: 14 } }, "\u21BA"))),
-        React.createElement("div", { style: { display: "flex", gap: 6 } }, PRESETS.map(([sec, lbl]) => (React.createElement("button", { key: sec, onClick: () => startWith(sec), style: { flex: 1, background: dur === sec ? "rgba(245,185,59,.14)" : c.bg, color: dur === sec ? c.accent : c.dim, border: `1px solid ${dur === sec ? c.accent : c.line}`, borderRadius: 9, padding: "7px 0", cursor: "pointer", fontWeight: 600, fontSize: 12.5 } }, lbl))))));
+        React.createElement("div", { style: { display: "flex", gap: 6 } }, PRESETS.map(([sec, lbl]) => (React.createElement("button", { key: sec, onClick: () => start(sec), style: { flex: 1, background: rt.dur === sec ? "rgba(245,185,59,.14)" : c.bg, color: rt.dur === sec ? c.accent : c.dim, border: `1px solid ${rt.dur === sec ? c.accent : c.line}`, borderRadius: 9, padding: "7px 0", cursor: "pointer", fontWeight: 600, fontSize: 12.5 } }, lbl))))));
 }
 function SetRow({ n, s, onW, onR, stepW, stepR }) {
     const done = s.w !== "" && s.r !== "";
